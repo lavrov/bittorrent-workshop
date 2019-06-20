@@ -13,7 +13,67 @@ import scodec.bits.ByteVector
 
 object BencodeCodec {
   val instance: Codec[Bencode] = {
-    lazily(???) // Implement codec!
+    val valueCodec = lazily(instance)
+    val asciiDigit: Codec[Char] = byte.exmap(
+      b => {
+        val char = b.toChar
+        if (char.isDigit) Attempt.Successful(char) else Attempt.Failure(Err(s"$char not a digit"))
+      },
+      c => Attempt.Successful(c.toByte)
+    )
+    val positiveNumber: Codec[Long] =
+      listSuccessful(asciiDigit).exmap(
+        {
+          case Nil => Attempt.failure(Err("No digits provided"))
+          case nonEmpty => Attempt.successful(nonEmpty.mkString.toLong)
+        },
+        value => Attempt.successful(value.toString.toList)
+      )
+
+    val number: Codec[Long] = {
+      val positiveInverted = positiveNumber.xmap[Long](v => -v, v => -v)
+      recover(constant('-'))
+        .consume {
+          case true => positiveInverted
+          case false => positiveNumber
+        } { value =>
+          value < 0
+        }
+    }
+
+    val integerCodec: Codec[Bencode.BInteger] =
+      (constant('i') ~> number <~ constant('e')).xmap(
+        Bencode.BInteger(_),
+        _.value
+      )
+    val stringCodec: Codec[Bencode.BString] =
+      (positiveNumber <~ constant(':')).consume[Bencode.BString](
+        size => bytes(size.toInt).xmap(Bencode.BString(_), _.value)
+      )(
+        _.value.size
+      )
+    val listCodec: Codec[Bencode.BList] =
+      (constant('l') ~> listSuccessful(valueCodec) <~ constant('e')).xmap(
+        elems => Bencode.BList(elems),
+        list => list.values
+      )
+    val keyValueCodec: Codec[String ~ Bencode] = (stringCodec ~ valueCodec).xmap(
+      { case (Bencode.BString(key), value) => (key.decodeAscii.right.get, value) },
+      { case (key, value) => (Bencode.BString(ByteVector.encodeAscii(key).right.get), value) }
+    )
+    val dictionaryCodec: Codec[Bencode.BDictionary] =
+      (constant('d') ~> listSuccessful(keyValueCodec) <~ constant('e'))
+        .xmap(
+          elems => Bencode.BDictionary(elems.toMap),
+          dict => dict.values.toList
+        )
+
+    choice(
+      integerCodec.upcast,
+      stringCodec.upcast,
+      listCodec.upcast,
+      dictionaryCodec.upcast
+    )
   }
 
   /**
